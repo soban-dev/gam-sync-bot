@@ -1,4 +1,4 @@
-name: Scheduler Test
+name: Scheduler Test2
 
 on:
   workflow_dispatch:        # ✅ This should be here
