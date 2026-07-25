@@ -17,18 +17,14 @@ jobs:
       GAM_NETWORK_CODE: ${{ secrets.GAM_NETWORK_CODE }}
 
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: "3.12"
 
-      - name: Install dependencies
-        run: |
+      - run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run Sync
-        run: python sync.py --once
+      - run: python sync.py --once
