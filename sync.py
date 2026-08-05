@@ -684,21 +684,20 @@ def sync_network_codes(supabase: SupabaseClient, token: str) -> dict:
             # (idempotent — the date doesn't change). Fall back to existing/now if missing.
             if inv == "REJECTED" or inv == "WITHDRAWN":
                 row["declined_at"] = child.get("last_modified_at") or prev.get("declined_at") or now_iso
-            # First time we observe a child as ACTIVE: stamp GAM's last modified
-            # DateTime for the company (preserve the original activation date).
+            # First time we observe a child as ACTIVE: stamp the date the bot
+            # discovered it (not GAM's last_modified, which can be misleading).
             if (
                 has_active_since
                 and status == "ACTIVE"
                 and not prev.get("active_since")
-                and child.get("last_modified_at")
             ):
-                row["active_since"] = child["last_modified_at"]
+                row["active_since"] = now_iso
             update_rows.append({**row, "last_synced_at": now_iso})
         elif is_user_child:
             if inv in ("REJECTED", "WITHDRAWN"):
                 row["declined_at"] = child.get("last_modified_at") or now_iso
-            if has_active_since and status == "ACTIVE" and child.get("last_modified_at"):
-                row["active_since"] = child["last_modified_at"]
+            if has_active_since and status == "ACTIVE":
+                row["active_since"] = now_iso
             insert_rows.append(row)
             log.info("Queued new child: %s (%s) status=%s dt=%s (last_synced_at not set — first sync pending)", code, name or "no name", status, dt)
         else:
