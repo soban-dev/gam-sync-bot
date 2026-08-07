@@ -1104,7 +1104,7 @@ def refresh_code_performance(supabase: SupabaseClient, network_code: str) -> Non
     does a plain SELECT per code — no aggregation at read time (PGRST123 disabled).
     """
     today = get_date_days_ago(0)
-    week_start = get_date_days_ago(7)
+    week_start = get_date_days_ago(6)
     try:
         resp = supabase.table("adx_daily_stats").select(
             "date, platform, revenue, impressions, clicks"
@@ -1314,6 +1314,7 @@ def refresh_performance_bulk(supabase: SupabaseClient, downloaded: list[dict], n
     if not downloaded:
         return
     today = get_date_days_ago(0)
+    week_start = get_date_days_ago(6)  # last 7 days inclusive (matches dashboard "7 days")
 
     # Existing first_data_date for every code — one paginated query.
     existing: dict[str, str] = {}
@@ -1351,9 +1352,11 @@ def refresh_performance_bulk(supabase: SupabaseClient, downloaded: list[dict], n
                 first = dt
             is_na = (r.get("platform") or "").strip() == "(Not applicable)"
             is_ios = is_ios_os(r.get("os") or "")
-            w_imp_os += imp
-            if is_ios:
-                w_ios += imp
+            in_week = dt >= week_start
+            if in_week:
+                w_imp_os += imp
+                if is_ios:
+                    w_ios += imp
             if dt == today:
                 t_rev += rev
                 t_imp += imp
@@ -1365,13 +1368,14 @@ def refresh_performance_bulk(supabase: SupabaseClient, downloaded: list[dict], n
                     t_na += rev
                 else:
                     t_app += rev
-            w_rev += rev
-            w_imp += imp
-            w_clk += clk
-            if is_na:
-                w_na += rev
-            else:
-                w_app += rev
+            if in_week:
+                w_rev += rev
+                w_imp += imp
+                w_clk += clk
+                if is_na:
+                    w_na += rev
+                else:
+                    w_app += rev
         upserts.append({
             "network_code": d["network_code"],
             "today_revenue": round(t_rev, 6),
