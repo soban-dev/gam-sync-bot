@@ -1030,6 +1030,12 @@ def upsert_report_rows(supabase: SupabaseClient, network_code: str, rows: list[d
         return 0
 
     now_iso = datetime.now(timezone.utc).isoformat()
+    _dates = sorted({r["date"] for r in rows})
+    if _dates:
+        try:
+            supabase.table("adx_daily_stats").delete().eq("network_code", network_code).gte("date", _dates[0]).lte("date", _dates[-1]).execute()
+        except Exception as e:
+            log.warning("pre-delete adx_daily_stats failed for %s: %s", network_code, str(e)[:200])
     to_upsert = [
         {
             "network_code": network_code,
@@ -1061,6 +1067,11 @@ def upsert_report_rows(supabase: SupabaseClient, network_code: str, rows: list[d
         }
         for r in aggregate_os_rows(rows)
     ]
+    if _dates:
+        try:
+            supabase.table("adx_os_stats").delete().eq("network_code", network_code).gte("date", _dates[0]).lte("date", _dates[-1]).execute()
+        except Exception as e:
+            log.warning("pre-delete adx_os_stats failed for %s: %s", network_code, str(e)[:200])
     for i in range(0, len(os_upsert), 500):
         batch = os_upsert[i:i + 500]
         try:
@@ -1264,6 +1275,17 @@ def upsert_daily_rows(supabase: SupabaseClient, network_code: str, rows: list[di
     if not rows:
         return 0
 
+    # Replace, don't accumulate: every cycle re-fetches [effective_start, today],
+    # so first delete this code's rows already stored in the fetched date range.
+    # Prevents duplicate/leftover rows from piling up and flipping daily totals.
+    _dates = sorted({r["date"] for r in rows})
+    if _dates:
+        _min, _max = _dates[0], _dates[-1]
+        try:
+            supabase.table("adx_daily_stats").delete().eq("network_code", network_code).gte("date", _min).lte("date", _max).execute()
+        except Exception as e:
+            log.warning("pre-delete adx_daily_stats failed for %s: %s", network_code, str(e)[:200])
+
     to_upsert = [
         {
             "network_code": network_code,
@@ -1294,6 +1316,11 @@ def upsert_daily_rows(supabase: SupabaseClient, network_code: str, rows: list[di
         }
         for r in aggregate_os_rows(rows)
     ]
+    if _dates:
+        try:
+            supabase.table("adx_os_stats").delete().eq("network_code", network_code).gte("date", _min).lte("date", _max).execute()
+        except Exception as e:
+            log.warning("pre-delete adx_os_stats failed for %s: %s", network_code, str(e)[:200])
     for i in range(0, len(os_upsert), 500):
         batch = os_upsert[i:i + 500]
         try:
@@ -1443,17 +1470,19 @@ def process_completed_jobs(completed_jobs: list[dict], supabase: SupabaseClient,
             else:
                 error_count += 1
 
-    # C3: batch refresh pre-computed summaries (a couple of bulk DB calls)
-    refresh_performance_bulk(supabase, downloaded, now_iso)
-
-    # C3b: recompute today / last-7 / last-30 day totals server-side (single RPC).
-    # Source of truth is adx_daily_stats + adx_os_stats, so the dashboard reads
-    # stable snapshots that never drift between sync cycles. Safe to skip if the
+    # C3: batch refresh pre-computed summaries. The SQL RPC is the single source
+    # of truth — it recomputes today / last-7 / last-30 day totals server-side
+    # from the frozen raw tables, so the dashboard never drifts between cycles.
+    # The in-memory fallback (refresh_performance_bulk) only runs when the
     # migration (migration_dashboard_totals.sql) hasn't been applied yet.
+    rpc_ok = False
     try:
         supabase.rpc("refresh_dashboard_totals").execute()
+        rpc_ok = True
     except Exception as e:
-        log.warning("refresh_dashboard_totals skipped: %s", str(e)[:200])
+        log.warning("refresh_dashboard_totals skipped (migration not applied?): %s", str(e)[:200])
+    if not rpc_ok:
+        refresh_performance_bulk(supabase, downloaded, now_iso)
 
     # C4: advance last_synced_at + clear errors for non-empty reports (bulk)
     if upserted_codes:
@@ -1487,7 +1516,7 @@ def process_completed_jobs(completed_jobs: list[dict], supabase: SupabaseClient,
 def run_sync_cycle() -> dict:
     start_time = time.time()
     end_date = get_date_days_ago(0)
-    week_start = get_date_days_ago(7)
+    week_start = get_date_days_ago(6)
 
     supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
     token = get_gam_token_cached()
@@ -1559,7 +1588,16 @@ def run_sync_cycle() -> dict:
             join_date = week_start
         last_synced = entry.get("last_synced_at")
         if last_synced:
-            start = effective_start(last_synced, week_start)
+            # Incremental: a day is FINAL once it has passed (GAM T+1). Never
+            # re-fetch days before yesterday except on the first cycle of a UTC
+            # day (which re-pulls the rolling 7-day window to close out the
+            # previous day). This freezes completed days — the #1 source of the
+            # 7-day total flapping was re-writing finished days every 13 min.
+            last_day = str(last_synced).split("T")[0]
+            if last_day >= end_date:
+                start = get_date_days_ago(1)  # already synced today: yesterday + today only
+            else:
+                start = effective_start(last_synced, week_start)  # first run of the day: full window
         else:
             # First sync — only fetch from the date the code was added
             start = join_date
