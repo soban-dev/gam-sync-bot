@@ -1087,6 +1087,10 @@ def sync_single_code(network_code: str, start_date: str, end_date: str, supabase
     try:
         rows = fetch_adx_report(network_code, start_date, end_date, token)
         total = upsert_report_rows(supabase, network_code, rows)
+        try:
+            supabase.rpc("refresh_dashboard_totals").execute()
+        except Exception as e:
+            log.warning("refresh_dashboard_totals skipped: %s", str(e)[:200])
         return {"network_code": network_code, "rows": total}
     except Exception as e:
         record_sync_failure(supabase, network_code, e)
@@ -1437,6 +1441,15 @@ def process_completed_jobs(completed_jobs: list[dict], supabase: SupabaseClient,
 
     # C3: batch refresh pre-computed summaries (a couple of bulk DB calls)
     refresh_performance_bulk(supabase, downloaded, now_iso)
+
+    # C3b: recompute today / last-7 / last-30 day totals server-side (single RPC).
+    # Source of truth is adx_daily_stats + adx_os_stats, so the dashboard reads
+    # stable snapshots that never drift between sync cycles. Safe to skip if the
+    # migration (migration_dashboard_totals.sql) hasn't been applied yet.
+    try:
+        supabase.rpc("refresh_dashboard_totals").execute()
+    except Exception as e:
+        log.warning("refresh_dashboard_totals skipped: %s", str(e)[:200])
 
     # C4: advance last_synced_at + clear errors for non-empty reports (bulk)
     if upserted_codes:
