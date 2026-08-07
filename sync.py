@@ -627,7 +627,7 @@ def sync_network_codes(supabase: SupabaseClient, token: str) -> dict:
     has_active_since = True
     try:
         existing_resp = supabase.table("network_codes").select(
-            "network_code, account_status, declined_at, active_since, source"
+            "network_code, account_status, declined_at, active_since, created_at, source"
         ).execute()
     except Exception:
         has_active_since = False
@@ -685,13 +685,15 @@ def sync_network_codes(supabase: SupabaseClient, token: str) -> dict:
             if inv == "REJECTED" or inv == "WITHDRAWN":
                 row["declined_at"] = child.get("last_modified_at") or prev.get("declined_at") or now_iso
             # First time we observe a child as ACTIVE: stamp the date the bot
-            # discovered it (not GAM's last_modified, which can be misleading).
+            # discovered it. For pre-existing codes that's created_at (the day we
+            # first saw them in MCM) — NOT "now", otherwise we'd wipe their
+            # earlier history. For genuinely new children created_at == now anyway.
             if (
                 has_active_since
                 and status == "ACTIVE"
                 and not prev.get("active_since")
             ):
-                row["active_since"] = now_iso
+                row["active_since"] = prev.get("created_at") or now_iso
             update_rows.append({**row, "last_synced_at": now_iso})
         elif is_user_child:
             if inv in ("REJECTED", "WITHDRAWN"):
