@@ -1,9 +1,7 @@
-name: GAM Sync v2
+name: GAM Sync v1
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '*/5 * * * *'
 
 jobs:
   sync:
