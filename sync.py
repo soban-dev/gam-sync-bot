@@ -598,6 +598,24 @@ def fetch_child_publisher_details(token: str, parent_code: str) -> dict[str, dic
     return details
 
 
+def fetch_all_network_codes(
+    supabase: SupabaseClient,
+    columns: str,
+    page_size: int = 1000,
+) -> list[dict]:
+    """Fetch all network_codes rows in pages so we never hit PostgREST's 1000-row cap."""
+    rows: list[dict] = []
+    offset = 0
+    while True:
+        resp = supabase.table("network_codes").select(columns).range(offset, offset + page_size - 1).execute()
+        chunk = resp.data or []
+        rows.extend(chunk)
+        if len(chunk) < page_size:
+            break
+        offset += page_size
+    return rows
+
+
 def sync_network_codes(supabase: SupabaseClient, token: str) -> dict:
     """
     Fetch ALL MCM child publishers from GAM via CompanyService and
@@ -626,15 +644,17 @@ def sync_network_codes(supabase: SupabaseClient, token: str) -> dict:
     # hasn't been migrated yet, so the bot keeps running pre-migration).
     has_active_since = True
     try:
-        existing_resp = supabase.table("network_codes").select(
-            "network_code, account_status, declined_at, active_since, created_at, source"
-        ).execute()
+        existing_rows = fetch_all_network_codes(
+            supabase,
+            "network_code, account_status, declined_at, active_since, created_at, source",
+        )
     except Exception:
         has_active_since = False
-        existing_resp = supabase.table("network_codes").select(
-            "network_code, account_status, declined_at, source"
-        ).execute()
-    existing_codes = {r["network_code"]: r for r in (existing_resp.data or [])}
+        existing_rows = fetch_all_network_codes(
+            supabase,
+            "network_code, account_status, declined_at, source",
+        )
+    existing_codes = {r["network_code"]: r for r in existing_rows}
 
     now_iso = datetime.now(timezone.utc).isoformat()
 
@@ -977,9 +997,8 @@ def cleanup_prejoin_data(supabase: SupabaseClient) -> int:
 
 
 def _cleanup_prejoin_loop(supabase: SupabaseClient) -> int:
-    resp = supabase.table("network_codes").select("network_code, created_at, active_since").execute()
     deleted = 0
-    for entry in resp.data or []:
+    for entry in fetch_all_network_codes(supabase, "network_code, created_at, active_since"):
         code = entry.get("network_code", "").strip()
         boundary = entry.get("active_since") or entry.get("created_at") or ""
         join = boundary[:10]
@@ -1533,8 +1552,7 @@ def run_sync_cycle() -> dict:
     mcm_earnings_rows = 0
 
     # Step 2: Fetch all network codes from DB
-    resp = supabase.table("network_codes").select("*").execute()
-    all_codes = resp.data or []
+    all_codes = fetch_all_network_codes(supabase, "*")
     log.info("Found %d entries in network_codes", len(all_codes))
 
     if not all_codes:
