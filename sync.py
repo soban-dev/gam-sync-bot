@@ -60,7 +60,22 @@ except ModuleNotFoundError:
     script_dir = os.path.dirname(os.path.abspath(__file__))
     if script_dir not in sys.path:
         sys.path.insert(0, script_dir)
-    from bigquery_store import BigQueryStore
+    try:
+        from bigquery_store import BigQueryStore
+    except ModuleNotFoundError:
+        class BigQueryStore:  # type: ignore[override]
+            def __init__(self, enabled=None):
+                self.enabled = False
+
+            @property
+            def client(self):
+                return None
+
+            def ensure_tables(self):
+                return False
+
+            def load(self, _table, _rows):
+                return 0
 
 load_dotenv()
 
@@ -88,8 +103,8 @@ def env_flag(name: str, default: str = "true") -> bool:
     return os.getenv(name, default).strip().lower() not in ("0", "false", "no", "off")
 
 
-PREJOIN_CLEANUP_ENABLED = env_flag("PREJOIN_CLEANUP_ENABLED", "true")
-RETENTION_CLEANUP_ENABLED = env_flag("RETENTION_CLEANUP_ENABLED", "true")
+PREJOIN_CLEANUP_ENABLED = False
+RETENTION_CLEANUP_ENABLED = False
 
 # BigQuery mirror: every MA write is also merged into Google BigQuery so the
 # whole MA dataset lives in the big-data warehouse (full history — retention
