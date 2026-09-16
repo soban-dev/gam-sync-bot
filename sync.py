@@ -54,7 +54,13 @@ from supabase import create_client, Client as SupabaseClient
 from google.oauth2 import service_account
 from google.auth.transport import requests as gauth_requests
 
-from bigquery_store import BigQueryStore
+try:
+    from bigquery_store import BigQueryStore
+except ModuleNotFoundError:
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    if script_dir not in sys.path:
+        sys.path.insert(0, script_dir)
+    from bigquery_store import BigQueryStore
 
 load_dotenv()
 
