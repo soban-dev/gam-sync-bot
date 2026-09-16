@@ -23,6 +23,14 @@ Requires .env file with:
   SUPABASE_URL, SUPABASE_SERVICE_KEY,
   GAM_CLIENT_EMAIL, GAM_PRIVATE_KEY,
   GAM_NETWORK_CODE                  # parent MCM network code (for auto-fetch)
+
+Optional BigQuery mirror (stores every MA write into Google BigQuery for
+big-data queries — full history, no retention cleanup mirrored):
+  BIGQUERY_ENABLED                  default "true"
+  BIGQUERY_PROJECT_ID               required to enable the mirror
+  BIGQUERY_DATASET                  default "ma_data"
+  GOOGLE_APPLICATION_CREDENTIALS    path to a BigQuery service-account JSON
+  BIGQUERY_CREDENTIALS_JSON         inline service-account JSON (alternative)
 """
 
 import os
@@ -46,6 +54,8 @@ from supabase import create_client, Client as SupabaseClient
 from google.oauth2 import service_account
 from google.auth.transport import requests as gauth_requests
 
+from bigquery_store import BigQueryStore
+
 load_dotenv()
 
 # ── Configuration ───────────────────────────────────────────────
@@ -66,6 +76,73 @@ RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "60"))
 LOG_DIR = os.getenv("LOG_DIR", "logs")
 MCM_EARNINGS_MONTHS = int(os.getenv("MCM_EARNINGS_MONTHS", "3"))
 GAM_VERSION = "v202602"
+
+
+def env_flag(name: str, default: str = "true") -> bool:
+    return os.getenv(name, default).strip().lower() not in ("0", "false", "no", "off")
+
+
+PREJOIN_CLEANUP_ENABLED = env_flag("PREJOIN_CLEANUP_ENABLED", "true")
+RETENTION_CLEANUP_ENABLED = env_flag("RETENTION_CLEANUP_ENABLED", "true")
+
+# BigQuery mirror: every MA write is also merged into Google BigQuery so the
+# whole MA dataset lives in the big-data warehouse (full history — retention
+# and pre-join cleanups are NOT mirrored). Disable with BIGQUERY_ENABLED=false.
+BIGQUERY_ENABLED = os.getenv("BIGQUERY_ENABLED", "true").strip().lower() not in (
+    "0", "false", "no", "off",
+)
+bq = BigQueryStore(enabled=BIGQUERY_ENABLED)
+
+# ------------------------- Batched BigQuery loader -------------------------
+# Reduce number of table.write operations by collecting rows into in-memory
+# batches and issuing fewer, larger load jobs. This avoids BigQuery 429
+# rateLimitExceeded errors when the sync runs many concurrent per-code loads.
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "500"))
+_bq_batch_lock = threading.Lock()
+_bq_batches: dict[str, list] = {}
+
+def add_to_bq_batch(table: str, rows: list[dict]):
+    if not rows:
+        return
+    should_flush = False
+    current_size = 0
+    with _bq_batch_lock:
+        lst = _bq_batches.get(table)
+        if lst is None:
+            lst = []
+            _bq_batches[table] = lst
+        lst.extend(rows)
+        current_size = len(lst)
+        if current_size >= BATCH_SIZE:
+            should_flush = True
+    log.info("bigquery: queued %d %s row(s) for batch load (current_batch=%d)", len(rows), table, current_size)
+    if should_flush:
+        flush_bq_batch(table)
+
+def flush_bq_batch(table: str):
+    """Flush one table batch synchronously."""
+    with _bq_batch_lock:
+        rows = _bq_batches.get(table) or []
+        if not rows:
+            return
+        # Pop the current list and replace with a fresh one
+        _bq_batches[table] = []
+    try:
+        n = bq.load(table, rows)
+        if n:
+            log.info("bigquery: batch loaded %d %s row(s)", n, table)
+        else:
+            log.warning("bigquery: batch load returned 0 rows for %s (rows discarded)", table)
+    except Exception as e:
+        log.error("bigquery: batch load exception for %s: %s", table, str(e)[:300])
+
+def flush_all_bq_batches():
+    """Flush all pending batches. Called at the end of a sync cycle."""
+    with _bq_batch_lock:
+        tables = list(_bq_batches.keys())
+    for t in tables:
+        flush_bq_batch(t)
+
 
 # ── Logging Setup ───────────────────────────────────────────────
 
@@ -790,6 +867,11 @@ def _upsert_network_codes(
                     else:
                         log.error("Failed to sync network_code %s: %s", row["network_code"], err)
 
+    mirror_rows = update_rows + insert_rows
+    if mirror_rows:
+        add_to_bq_batch("network_codes", mirror_rows)
+        log.info("bigquery: queued %d network_codes row(s) for batch load", len(mirror_rows))
+
     return upserted
 
 
@@ -899,6 +981,10 @@ def sync_mcm_earnings(supabase: SupabaseClient, token: str) -> int:
         log.info("mcm_earnings: upserted %d rows across %d months", total, len(months))
     except Exception as e:
         log.warning("mcm_earnings upsert failed (run migration.sql first?): %s", str(e)[:300])
+
+    if rows:
+        add_to_bq_batch("mcm_earnings", rows)
+        log.info("bigquery: queued %d mcm_earnings row(s) for batch load", len(rows))
     return total
 
 
@@ -1027,18 +1113,27 @@ def record_sync_failure(supabase: SupabaseClient, network_code: str, err: BaseEx
                 "updated_at": datetime.now(timezone.utc).isoformat(),
             }).eq("network_code", network_code).execute()
             log.info("Marked %s as NO_ACCESS (not a managed child)", network_code)
+            add_to_bq_batch(
+                "network_codes",
+                [{
+                    "network_code": network_code,
+                    "account_status": "NO_ACCESS",
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                }],
+            )
+            log.info("bigquery: queued 1 network_codes row (NO_ACCESS) for %s", network_code)
         except Exception:
             pass
 
     try:
-        supabase.table("adx_sync_errors").upsert(
-            {
-                "network_code": network_code,
-                "error_message": err_msg[:500],
-                "failed_at": datetime.now(timezone.utc).isoformat(),
-            },
-            on_conflict="network_code",
-        ).execute()
+        error_row = {
+            "network_code": network_code,
+            "error_message": err_msg[:500],
+            "failed_at": datetime.now(timezone.utc).isoformat(),
+        }
+        supabase.table("adx_sync_errors").upsert(error_row, on_conflict="network_code").execute()
+        add_to_bq_batch("adx_sync_errors", [error_row])
+        log.info("bigquery: queued 1 adx_sync_errors row for batch load")
     except Exception:
         pass
 
@@ -1107,6 +1202,17 @@ def upsert_report_rows(supabase: SupabaseClient, network_code: str, rows: list[d
         "last_synced_at": datetime.now(timezone.utc).isoformat(),
         "updated_at": now_iso,
     }).eq("network_code", network_code).execute()
+    add_to_bq_batch("network_codes", [{
+        "network_code": network_code,
+        "last_synced_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": now_iso,
+    }])
+    if to_upsert:
+        add_to_bq_batch("adx_daily_stats", to_upsert)
+        log.info("bigquery: queued %d adx_daily_stats row(s) for %s", len(to_upsert), network_code)
+    if os_upsert:
+        add_to_bq_batch("adx_os_stats", os_upsert)
+        log.info("bigquery: queued %d adx_os_stats row(s) for %s", len(os_upsert), network_code)
 
     # Pre-compute today + last-7-days summary so the API never aggregates at read time
     refresh_code_performance(supabase, network_code)
@@ -1198,7 +1304,7 @@ def refresh_code_performance(supabase: SupabaseClient, network_code: str) -> Non
 
 
         now_iso = datetime.now(timezone.utc).isoformat()
-        supabase.table("network_code_performance").upsert({
+        perf_row = {
             "network_code": network_code,
             "today_revenue": round(t_rev, 6),
             "today_impressions": t_imp,
@@ -1215,7 +1321,10 @@ def refresh_code_performance(supabase: SupabaseClient, network_code: str) -> Non
             "first_data_date": first_date,
             "last_synced_at": now_iso,
             "updated_at": now_iso,
-        }, on_conflict="network_code").execute()
+        }
+        supabase.table("network_code_performance").upsert(perf_row, on_conflict="network_code").execute()
+        add_to_bq_batch("network_code_performance", [perf_row])
+        log.info("bigquery: queued 1 network_code_performance row for %s", network_code)
     except Exception as e:
         log.warning("Performance summary failed for %s: %s", network_code, str(e)[:200])
 
@@ -1348,6 +1457,13 @@ def upsert_daily_rows(supabase: SupabaseClient, network_code: str, rows: list[di
             supabase.table("adx_os_stats").upsert(batch, on_conflict="network_code,date,os").execute()
         except Exception as e:
             log.warning("adx_os_stats upsert failed for %s: %s", network_code, str(e)[:200])
+
+    if to_upsert:
+        add_to_bq_batch("adx_daily_stats", to_upsert)
+        log.info("bigquery: queued %d adx_daily_stats row(s) for %s", len(to_upsert), network_code)
+    if os_upsert:
+        add_to_bq_batch("adx_os_stats", os_upsert)
+        log.info("bigquery: queued %d adx_os_stats row(s) for %s", len(os_upsert), network_code)
     return total
 
 
@@ -1448,6 +1564,10 @@ def refresh_performance_bulk(supabase: SupabaseClient, downloaded: list[dict], n
             upserts[i:i + 500], on_conflict="network_code"
         ).execute()
 
+    if upserts:
+        add_to_bq_batch("network_code_performance", upserts)
+        log.info("bigquery: queued %d network_code_performance row(s) for batch load", len(upserts))
+
 
 def process_completed_jobs(completed_jobs: list[dict], supabase: SupabaseClient, token: str) -> tuple[int, int]:
     """Phase C — download all CSVs concurrently, upsert all rows, then batch
@@ -1515,6 +1635,11 @@ def process_completed_jobs(completed_jobs: list[dict], supabase: SupabaseClient,
                     "updated_at": now_iso,
                 }).in_("network_code", chunk).execute()
                 supabase.table("adx_sync_errors").delete().in_("network_code", chunk).execute()
+                add_to_bq_batch(
+                    "network_codes",
+                    [{"network_code": c, "last_synced_at": now_iso, "updated_at": now_iso} for c in chunk],
+                )
+                log.info("bigquery: queued %d network_codes row(s) for batch load", len(chunk))
             except Exception as e:
                 log.warning("Batch last_synced update failed: %s", str(e)[:200])
 
@@ -1556,6 +1681,10 @@ def run_sync_cycle() -> dict:
     log.info("Found %d entries in network_codes", len(all_codes))
 
     if not all_codes:
+        try:
+            flush_all_bq_batches()
+        except Exception:
+            pass
         return {"status": "skipped", "reason": "no codes", "elapsed": time.time() - start_time}
 
     # Step 3: Filter to only ACTIVE publishers (or codes without status = backward compat)
@@ -1587,6 +1716,10 @@ def run_sync_cycle() -> dict:
 
     if not active_list:
         log.info("No ACTIVE network codes found — nothing to sync")
+        try:
+            flush_all_bq_batches()
+        except Exception:
+            pass
         return {
             "status": "skipped",
             "reason": "no active codes",
@@ -1634,8 +1767,12 @@ def run_sync_cycle() -> dict:
     completed_jobs = poll_all_report_jobs(submitted_jobs, supabase, token)
     total_rows, error_count = process_completed_jobs(completed_jobs, supabase, token)
 
-    cutoff = get_date_days_ago(RETENTION_DAYS)
-    deleted = cleanup_old_data(supabase, cutoff)
+    deleted = 0
+    if RETENTION_CLEANUP_ENABLED:
+        cutoff = get_date_days_ago(RETENTION_DAYS)
+        deleted = cleanup_old_data(supabase, cutoff)
+    else:
+        log.info("Retention cleanup disabled (RETENTION_CLEANUP_ENABLED=false)")
 
     elapsed = round(time.time() - start_time, 1)
     stats = {
@@ -1651,6 +1788,10 @@ def run_sync_cycle() -> dict:
         "retention_days": RETENTION_DAYS,
         "elapsed_seconds": elapsed,
     }
+    try:
+        flush_all_bq_batches()
+    except Exception as e:
+        log.warning("Failed to flush BigQuery batches at end of cycle: %s", str(e)[:200])
     log.info("Sync cycle complete: %s", json.dumps(stats))
     return stats
 
@@ -1676,11 +1817,14 @@ def main():
 
     # One-time cleanup: remove any adx_daily_stats rows older than a child's join date.
     # Idempotent — after the first run there is nothing left to remove.
-    try:
-        startup_supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
-        cleanup_prejoin_data(startup_supabase)
-    except Exception as e:
-        log.warning("Pre-join cleanup skipped: %s", str(e)[:200])
+    if PREJOIN_CLEANUP_ENABLED:
+        try:
+            startup_supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+            cleanup_prejoin_data(startup_supabase)
+        except Exception as e:
+            log.warning("Pre-join cleanup skipped: %s", str(e)[:200])
+    else:
+        log.info("Pre-join cleanup disabled (PREJOIN_CLEANUP_ENABLED=false)")
 
     cycle = 0
     while not shutdown_flag.is_set():
