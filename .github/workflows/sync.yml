@@ -7,12 +7,25 @@ jobs:
   sync:
     runs-on: ubuntu-latest
 
+    defaults:
+      run:
+        working-directory: scripts/gam-sync-bot
+
     env:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
       GAM_CLIENT_EMAIL: ${{ secrets.GAM_CLIENT_EMAIL }}
       GAM_PRIVATE_KEY: ${{ secrets.GAM_PRIVATE_KEY }}
       GAM_NETWORK_CODE: ${{ secrets.GAM_NETWORK_CODE }}
+
+      BIGQUERY_ENABLED: "true"
+      BIGQUERY_PROJECT_ID: ${{ secrets.BIGQUERY_PROJECT_ID }}
+      BIGQUERY_DATASET: ${{ secrets.BIGQUERY_DATASET }}
+      BIGQUERY_CREDENTIALS_JSON: ${{ secrets.BIGQUERY_CREDENTIALS_JSON }}
+      BIGQUERY_LOCATION: ${{ secrets.BIGQUERY_LOCATION }}
+
+      PREJOIN_CLEANUP_ENABLED: "false"
+      RETENTION_CLEANUP_ENABLED: "false"
 
     steps:
       - uses: actions/checkout@v4
@@ -21,8 +34,16 @@ jobs:
         with:
           python-version: "3.12"
 
-      - run: |
+      - name: Install dependencies
+        run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - run: python sync.py --once
+      - name: Verify bot files exist
+        run: |
+          ls -la
+          test -f sync.py
+          test -f bigquery_store.py
+
+      - name: Run sync once
+        run: python sync.py --once
