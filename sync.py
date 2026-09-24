@@ -94,6 +94,7 @@ DOWNLOAD_CONCURRENCY = int(os.getenv("DOWNLOAD_CONCURRENCY", "8"))
 REPORT_POLL_INTERVAL = int(os.getenv("REPORT_POLL_INTERVAL", "3"))
 REPORT_POLL_TIMEOUT = int(os.getenv("REPORT_POLL_TIMEOUT", "300"))
 RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "60"))
+ERROR_RETENTION_HOURS = int(os.getenv("ERROR_RETENTION_HOURS", "24"))
 LOG_DIR = os.getenv("LOG_DIR", "logs")
 MCM_EARNINGS_MONTHS = int(os.getenv("MCM_EARNINGS_MONTHS", "3"))
 GAM_VERSION = "v202602"
@@ -1090,6 +1091,18 @@ def cleanup_old_data(supabase: SupabaseClient, cutoff_date: str) -> int:
         return 0
 
 
+def cleanup_old_sync_errors(supabase: SupabaseClient, cutoff_iso: str) -> int:
+    try:
+        resp = supabase.table("adx_sync_errors").delete().lt("failed_at", cutoff_iso).execute()
+        deleted = len(resp.data) if resp.data else 0
+        if deleted:
+            log.info("Cleared %d stale sync error(s) older than %s", deleted, cutoff_iso)
+        return deleted
+    except Exception as e:
+        log.warning("Sync error cleanup failed: %s", e)
+        return 0
+
+
 def cleanup_prejoin_data(supabase: SupabaseClient) -> int:
     """
     Idempotent startup cleanup: delete adx_daily_stats rows older than the
@@ -1789,11 +1802,15 @@ def run_sync_cycle() -> dict:
     total_rows, error_count = process_completed_jobs(completed_jobs, supabase, token)
 
     deleted = 0
+    stale_errors_deleted = 0
     if RETENTION_CLEANUP_ENABLED:
         cutoff = get_date_days_ago(RETENTION_DAYS)
         deleted = cleanup_old_data(supabase, cutoff)
     else:
         log.info("Retention cleanup disabled (RETENTION_CLEANUP_ENABLED=false)")
+
+    error_cutoff_iso = (datetime.now(timezone.utc) - timedelta(hours=ERROR_RETENTION_HOURS)).isoformat()
+    stale_errors_deleted = cleanup_old_sync_errors(supabase, error_cutoff_iso)
 
     elapsed = round(time.time() - start_time, 1)
     stats = {
@@ -1806,7 +1823,9 @@ def run_sync_cycle() -> dict:
         "codes_errored": error_count,
         "total_rows_upserted": total_rows,
         "rows_deleted": deleted,
+        "sync_errors_deleted": stale_errors_deleted,
         "retention_days": RETENTION_DAYS,
+        "error_retention_hours": ERROR_RETENTION_HOURS,
         "elapsed_seconds": elapsed,
     }
     try:
