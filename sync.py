@@ -1160,9 +1160,29 @@ def record_sync_failure(supabase: SupabaseClient, network_code: str, err: BaseEx
             pass
 
     try:
+        normalized_msg = err_msg[:500]
+        existing_msg = ""
+        try:
+            existing = (
+                supabase.table("adx_sync_errors")
+                .select("error_message")
+                .eq("network_code", network_code)
+                .limit(1)
+                .execute()
+            )
+            if existing.data:
+                existing_msg = str((existing.data[0] or {}).get("error_message") or "")[:500]
+        except Exception:
+            existing_msg = ""
+
+        # Do not rewrite the same error every cycle.
+        # Keep the original failed_at so 24h hiding/cleanup can work as intended.
+        if existing_msg == normalized_msg:
+            return
+
         error_row = {
             "network_code": network_code,
-            "error_message": err_msg[:500],
+            "error_message": normalized_msg,
             "failed_at": datetime.now(timezone.utc).isoformat(),
         }
         supabase.table("adx_sync_errors").upsert(error_row, on_conflict="network_code").execute()
