@@ -1721,6 +1721,12 @@ def run_sync_cycle() -> dict:
     supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
     token = get_gam_token_cached()
 
+    try:
+        if hasattr(bq, "begin_cycle"):
+            bq.begin_cycle()
+    except Exception as e:
+        log.warning("bigquery: begin_cycle failed: %s", str(e)[:200])
+
     # Step 1: Auto-fetch child publishers from MCM parent (if configured)
     mcm_stats = sync_network_codes(supabase, token)
     if mcm_stats.get("children_found", 0) > 0:

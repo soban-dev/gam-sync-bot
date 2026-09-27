@@ -14,6 +14,7 @@ Config (env vars, see .env.example):
   BIGQUERY_ENABLED             default "true"
   BIGQUERY_PROJECT_ID          required, e.g. "adglobe-x"
   BIGQUERY_DATASET             default "ma_data"
+  BIGQUERY_MIRROR_MODE         "append" (default) | "truncate_each_cycle" | "replace"
   GOOGLE_APPLICATION_CREDENTIALS  path to a BigQuery service-account JSON
   BIGQUERY_CREDENTIALS_JSON     inline service-account JSON (alternative)
 """
@@ -213,6 +214,13 @@ class BigQueryStore:
         self.enabled = enabled
         self._client = None
         self._client_error = None
+        self._cycle_truncated_tables = set()
+        self._cycle_lock = threading.Lock()
+
+    def begin_cycle(self):
+        """Marks the start of a new sync cycle for per-cycle table reset mode."""
+        with self._cycle_lock:
+            self._cycle_truncated_tables.clear()
 
     @property
     def client(self):
@@ -293,6 +301,21 @@ class BigQueryStore:
 
         spec = TABLES[table]
         converted = [self._convert_row(r, spec) for r in rows]
+        mirror_mode = os.getenv("BIGQUERY_MIRROR_MODE", "append").strip().lower()
+
+        write_disposition = "WRITE_APPEND"
+        if mirror_mode == "truncate_each_cycle":
+            # Free-tier friendly: avoid TRUNCATE TABLE DDL/DML requirement.
+            # First batch for each table in the cycle uses WRITE_TRUNCATE,
+            # remaining batches use WRITE_APPEND.
+            with self._cycle_lock:
+                first_batch_this_cycle = table not in self._cycle_truncated_tables
+                if first_batch_this_cycle:
+                    self._cycle_truncated_tables.add(table)
+            write_disposition = "WRITE_TRUNCATE" if first_batch_this_cycle else "WRITE_APPEND"
+        elif mirror_mode == "replace":
+            # Replace on every load call (not recommended with tiny batches).
+            write_disposition = "WRITE_TRUNCATE"
 
         # Retry on rate-limit / transient BigQuery errors with exponential backoff
         max_attempts = int(os.getenv("BIGQUERY_LOAD_RETRIES", "5"))
@@ -306,7 +329,7 @@ class BigQueryStore:
                     job = self.client.load_table_from_json(
                         converted,
                         self.table_ref(table),
-                        job_config=LoadJobConfig(write_disposition="WRITE_APPEND"),
+                        job_config=LoadJobConfig(write_disposition=write_disposition),
                     )
                     job.result()
                     return job.output_rows
