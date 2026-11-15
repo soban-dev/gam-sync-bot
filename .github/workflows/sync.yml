@@ -20,9 +20,6 @@ jobs:
       BIGQUERY_CREDENTIALS_JSON: ${{ secrets.BIGQUERY_CREDENTIALS_JSON }}
       BIGQUERY_LOCATION: ${{ secrets.BIGQUERY_LOCATION }}
 
-      PREJOIN_CLEANUP_ENABLED: "false"
-      RETENTION_CLEANUP_ENABLED: "false"
-
     steps:
       - uses: actions/checkout@v4
 

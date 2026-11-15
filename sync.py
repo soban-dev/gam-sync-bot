@@ -7,9 +7,11 @@ Runs every SYNC_INTERVAL minutes:
   2. Fetch fresh AdX report for each ACTIVE network code via a two-phase
      pipeline (submit all report jobs concurrently, poll in parallel, then
      download concurrently)
-  3. Upsert rows into adx_daily_stats
-  4. Delete rows older than RETENTION_DAYS
-  5. Log errors to adx_sync_errors
+  3. Mirror report rows and sync errors into BigQuery
+
+Supabase is only used for the network_codes registry (the code list, status
+and last_synced_at watermark). Reporting rows are mirrored to BigQuery,
+which is what the MA dashboard reads.
 
 Non-active publishers (pending, invited, inactive, suspended) are tracked
 in the DB but skipped for report generation until they become ACTIVE.
@@ -93,8 +95,6 @@ SUBMIT_CONCURRENCY = int(os.getenv("SUBMIT_CONCURRENCY", "16"))
 DOWNLOAD_CONCURRENCY = int(os.getenv("DOWNLOAD_CONCURRENCY", "8"))
 REPORT_POLL_INTERVAL = int(os.getenv("REPORT_POLL_INTERVAL", "3"))
 REPORT_POLL_TIMEOUT = int(os.getenv("REPORT_POLL_TIMEOUT", "300"))
-RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "60"))
-ERROR_RETENTION_HOURS = int(os.getenv("ERROR_RETENTION_HOURS", "24"))
 LOG_DIR = os.getenv("LOG_DIR", "logs")
 MCM_EARNINGS_MONTHS = int(os.getenv("MCM_EARNINGS_MONTHS", "3"))
 GAM_VERSION = "v202602"
@@ -104,10 +104,7 @@ def env_flag(name: str, default: str = "true") -> bool:
     return os.getenv(name, default).strip().lower() not in ("0", "false", "no", "off")
 
 
-PREJOIN_CLEANUP_ENABLED = False
-RETENTION_CLEANUP_ENABLED = False
-
-# BigQuery mirror: every MA write is also merged into Google BigQuery so the
+# BigQuery mirror: every report row is loaded into Google BigQuery so the
 # whole MA dataset lives in the big-data warehouse (full history — retention
 # and pre-join cleanups are NOT mirrored). Disable with BIGQUERY_ENABLED=false.
 BIGQUERY_ENABLED = os.getenv("BIGQUERY_ENABLED", "true").strip().lower() not in (
@@ -399,11 +396,6 @@ def aggregate_os_rows(rows: list[dict]) -> list[dict]:
         {"date": date, "os": os, "impressions": imp}
         for (date, os), imp in sorted(agg.items())
     ]
-
-
-def is_ios_os(os: str) -> bool:
-    s = (os or "").strip().lower()
-    return any(k in s for k in ("iphone", "ipad", "ipod", "ios", "apple"))
 
 
 def build_report_query(start_date: str, end_date: str) -> str:
@@ -905,8 +897,9 @@ def _remove_orphaned_network_codes(
     """
     Delete MCM-child codes we auto-tracked (source='mcm_child') that are no
     longer present under our parent in GAM (child removed / relationship ended).
-    Cascades: adx_daily_stats, network_code_performance, adx_sync_errors, and
-    the network_codes row itself. They'll be re-added if the child returns.
+    Only the network_codes registry row is deleted — reporting tables live in
+    BigQuery now, so there is nothing else to clean up here. They'll be
+    re-added if the child returns.
     """
     removed = [
         code for code, row in existing_codes.items()
@@ -915,13 +908,12 @@ def _remove_orphaned_network_codes(
     if not removed:
         return 0
 
-    for table in ("adx_daily_stats", "network_code_performance", "adx_sync_errors", "network_codes"):
-        for i in range(0, len(removed), 100):
-            chunk = removed[i:i + 100]
-            try:
-                supabase.table(table).delete().in_("network_code", chunk).execute()
-            except Exception as e:
-                log.warning("Cleanup delete failed on %s: %s", table, str(e)[:150])
+    for i in range(0, len(removed), 100):
+        chunk = removed[i:i + 100]
+        try:
+            supabase.table("network_codes").delete().in_("network_code", chunk).execute()
+        except Exception as e:
+            log.warning("Cleanup delete failed on network_codes: %s", str(e)[:150])
 
     log.info("Removed %d network code(s) no longer present in GAM: %s", len(removed), removed)
     return len(removed)
@@ -1079,64 +1071,17 @@ def effective_start(last_synced_at: Optional[str], default_start: str) -> str:
 #  SYNC LOGIC
 # ═════════════════════════════════════════════════════════════════
 
-def cleanup_old_data(supabase: SupabaseClient, cutoff_date: str) -> int:
-    try:
-        resp = supabase.table("adx_daily_stats").delete().lt("date", cutoff_date).execute()
-        deleted = len(resp.data) if resp.data else 0
-        if deleted:
-            log.info("Cleaned up %d rows older than %s", deleted, cutoff_date)
-        return deleted
-    except Exception as e:
-        log.warning("Cleanup error: %s", e)
-        return 0
-
-
-def cleanup_old_sync_errors(supabase: SupabaseClient, cutoff_iso: str) -> int:
-    try:
-        resp = supabase.table("adx_sync_errors").delete().lt("failed_at", cutoff_iso).execute()
-        deleted = len(resp.data) if resp.data else 0
-        if deleted:
-            log.info("Cleared %d stale sync error(s) older than %s", deleted, cutoff_iso)
-        return deleted
-    except Exception as e:
-        log.warning("Sync error cleanup failed: %s", e)
-        return 0
-
-
-def cleanup_prejoin_data(supabase: SupabaseClient) -> int:
-    """
-    Idempotent startup cleanup: delete adx_daily_stats rows older than the
-    child's active_since date (fallback created_at). These rows came from
-    querying the child's own network before the parent relationship existed.
-
-    Always uses the per-code REST loop (active_since-aware) rather than the
-    cleanup_prejoin_data() Postgres function, so it stays correct even if the
-    DB function was created with the old created_at-only logic.
-    """
-    return _cleanup_prejoin_loop(supabase)
-
-
-def _cleanup_prejoin_loop(supabase: SupabaseClient) -> int:
-    deleted = 0
-    for entry in fetch_all_network_codes(supabase, "network_code, created_at, active_since"):
-        code = entry.get("network_code", "").strip()
-        boundary = entry.get("active_since") or entry.get("created_at") or ""
-        join = boundary[:10]
-        if not code or not join:
-            continue
-        try:
-            dr = supabase.table("adx_daily_stats").delete().eq("network_code", code).lt("date", join).execute()
-            deleted += len(dr.data) if dr.data else 0
-        except Exception as e:
-            log.warning("Pre-join cleanup failed for %s: %s", code, str(e)[:200])
-    if deleted:
-        log.info("Pre-join cleanup removed %d rows older than their join date", deleted)
-    return deleted
+# Last error mirrored to BigQuery per network code (in-process, per run).
+_sync_error_cache: dict[str, str] = {}
+_sync_error_lock = threading.Lock()
 
 
 def record_sync_failure(supabase: SupabaseClient, network_code: str, err: BaseException, phase: str = "") -> None:
     """Log a failed sync for a code; mark as NO_ACCESS when the service account
-    can't reach the child network so we don't retry it every cycle."""
+    can't reach the child network so we don't retry it every cycle.
+
+    Errors are mirrored to BigQuery only. An in-process cache stops the same
+    error from being queued again on every 15-minute cycle."""
     err_msg = str(err)
     log.error("Error syncing %s [%s]: %s", network_code, phase or "unknown", err_msg)
 
@@ -1161,226 +1106,27 @@ def record_sync_failure(supabase: SupabaseClient, network_code: str, err: BaseEx
 
     try:
         normalized_msg = err_msg[:500]
-        existing_msg = ""
-        try:
-            existing = (
-                supabase.table("adx_sync_errors")
-                .select("error_message")
-                .eq("network_code", network_code)
-                .limit(1)
-                .execute()
-            )
-            if existing.data:
-                existing_msg = str((existing.data[0] or {}).get("error_message") or "")[:500]
-        except Exception:
-            existing_msg = ""
-
-        # Do not rewrite the same error every cycle.
-        # Keep the original failed_at so 24h hiding/cleanup can work as intended.
-        if existing_msg == normalized_msg:
-            return
+        with _sync_error_lock:
+            if _sync_error_cache.get(network_code) == normalized_msg:
+                return
+            _sync_error_cache[network_code] = normalized_msg
 
         error_row = {
             "network_code": network_code,
             "error_message": normalized_msg,
             "failed_at": datetime.now(timezone.utc).isoformat(),
         }
-        supabase.table("adx_sync_errors").upsert(error_row, on_conflict="network_code").execute()
         add_to_bq_batch("adx_sync_errors", [error_row])
         log.info("bigquery: queued 1 adx_sync_errors row for batch load")
     except Exception:
         pass
 
 
-def upsert_report_rows(supabase: SupabaseClient, network_code: str, rows: list[dict]) -> int:
-    """Upsert fetched report rows into adx_daily_stats and pre-compute the
-    today / last-7-days summary for the API (no read-time aggregation)."""
-    if not rows:
-        supabase.table("adx_sync_errors").delete().eq("network_code", network_code).execute()
-        return 0
-
-    now_iso = datetime.now(timezone.utc).isoformat()
-    _dates = sorted({r["date"] for r in rows})
-    if _dates:
-        try:
-            supabase.table("adx_daily_stats").delete().eq("network_code", network_code).gte("date", _dates[0]).lte("date", _dates[-1]).execute()
-        except Exception as e:
-            log.warning("pre-delete adx_daily_stats failed for %s: %s", network_code, str(e)[:200])
-    to_upsert = [
-        {
-            "network_code": network_code,
-            "date": r["date"],
-            "platform": r["platform"],
-            "revenue": r["revenue"],
-            "ecpm": r["ecpm"],
-            "impressions": r["impressions"],
-            "clicks": r["clicks"],
-            "ctr": r["ctr"],
-            "updated_at": now_iso,
-        }
-        for r in aggregate_daily_rows(rows)
-    ]
-
-    total = 0
-    for i in range(0, len(to_upsert), 500):
-        batch = to_upsert[i:i + 500]
-        resp = supabase.table("adx_daily_stats").upsert(batch, on_conflict="network_code,date,platform").execute()
-        total += len(resp.data) if resp.data else 0
-
-    os_upsert = [
-        {
-            "network_code": network_code,
-            "date": r["date"],
-            "os": r["os"],
-            "impressions": r["impressions"],
-            "updated_at": now_iso,
-        }
-        for r in aggregate_os_rows(rows)
-    ]
-    if _dates:
-        try:
-            supabase.table("adx_os_stats").delete().eq("network_code", network_code).gte("date", _dates[0]).lte("date", _dates[-1]).execute()
-        except Exception as e:
-            log.warning("pre-delete adx_os_stats failed for %s: %s", network_code, str(e)[:200])
-    for i in range(0, len(os_upsert), 500):
-        batch = os_upsert[i:i + 500]
-        try:
-            supabase.table("adx_os_stats").upsert(batch, on_conflict="network_code,date,os").execute()
-        except Exception as e:
-            log.warning("adx_os_stats upsert failed for %s: %s", network_code, str(e)[:200])
-
-    supabase.table("adx_sync_errors").delete().eq("network_code", network_code).execute()
-
-    # Mark last_synced_at so next cycle only fetches incremental data
-    supabase.table("network_codes").update({
-        "last_synced_at": datetime.now(timezone.utc).isoformat(),
-        "updated_at": now_iso,
-    }).eq("network_code", network_code).execute()
-    add_to_bq_batch("network_codes", [{
-        "network_code": network_code,
-        "last_synced_at": datetime.now(timezone.utc).isoformat(),
-        "updated_at": now_iso,
-    }])
-    if to_upsert:
-        add_to_bq_batch("adx_daily_stats", to_upsert)
-        log.info("bigquery: queued %d adx_daily_stats row(s) for %s", len(to_upsert), network_code)
-    if os_upsert:
-        add_to_bq_batch("adx_os_stats", os_upsert)
-        log.info("bigquery: queued %d adx_os_stats row(s) for %s", len(os_upsert), network_code)
-
-    # Pre-compute today + last-7-days summary so the API never aggregates at read time
-    refresh_code_performance(supabase, network_code)
-
-    log.info("Upserted %d rows for %s", total, network_code)
-    return total
-
-
-def sync_single_code(network_code: str, start_date: str, end_date: str, supabase: SupabaseClient, token: str) -> dict:
-    try:
-        rows = fetch_adx_report(network_code, start_date, end_date, token)
-        total = upsert_report_rows(supabase, network_code, rows)
-        try:
-            supabase.rpc("refresh_dashboard_totals").execute()
-        except Exception as e:
-            log.warning("refresh_dashboard_totals skipped: %s", str(e)[:200])
-        return {"network_code": network_code, "rows": total}
-    except Exception as e:
-        record_sync_failure(supabase, network_code, e)
-        return {"network_code": network_code, "error": str(e)}
-
-
-def refresh_code_performance(supabase: SupabaseClient, network_code: str) -> None:
-    """
-    Pre-compute today + last-7-days totals (revenue / impressions / clicks) for one
-    network code and upsert them into network_code_performance. The API then only
-    does a plain SELECT per code — no aggregation at read time (PGRST123 disabled).
-    """
-    today = get_date_days_ago(0)
-    week_start = get_date_days_ago(6)
-    try:
-        resp = supabase.table("adx_daily_stats").select(
-            "date, platform, revenue, impressions, clicks"
-        ).eq("network_code", network_code).gte("date", week_start).lte("date", today).execute()
-        rows = resp.data or []
-
-        t_rev = t_imp = t_clk = 0
-        t_app = t_na = 0
-        w_rev = w_imp = w_clk = 0
-        w_app = w_na = 0
-        for r in rows:
-            rev = float(r.get("revenue") or 0)
-            imp = int(r.get("impressions") or 0)
-            clk = int(r.get("clicks") or 0)
-            d = r.get("date") or ""
-            is_na = (r.get("platform") or "").strip() == "(Not applicable)"
-            if d == today:
-                t_rev += rev
-                t_imp += imp
-                t_clk += clk
-                if is_na:
-                    t_na += rev
-                else:
-                    t_app += rev
-            w_rev += rev
-            w_imp += imp
-            w_clk += clk
-            if is_na:
-                w_na += rev
-            else:
-                w_app += rev
-
-        first_date = None
-        try:
-            fr = supabase.table("v_network_code_first_date").select("first_date").eq("network_code", network_code).execute()
-            if fr.data and fr.data[0].get("first_date"):
-                first_date = fr.data[0]["first_date"]
-        except Exception:
-            pass
-
-        t_imp_os = w_imp_os = t_ios = w_ios = 0
-        try:
-            osr = supabase.table("adx_os_stats").select(
-                "date, os, impressions"
-            ).eq("network_code", network_code).gte("date", week_start).lte("date", today).execute()
-            for o in osr.data or []:
-                imp = int(o.get("impressions") or 0)
-                d = o.get("date") or ""
-                is_ios = is_ios_os(o.get("os") or "")
-                w_imp_os += imp
-                if is_ios:
-                    w_ios += imp
-                if d == today:
-                    t_imp_os += imp
-                    if is_ios:
-                        t_ios += imp
-        except Exception as e:
-            log.warning("adx_os_stats read failed for %s: %s", network_code, str(e)[:200])
-
-
-        now_iso = datetime.now(timezone.utc).isoformat()
-        perf_row = {
-            "network_code": network_code,
-            "today_revenue": round(t_rev, 6),
-            "today_impressions": t_imp,
-            "today_clicks": t_clk,
-            "week_revenue": round(w_rev, 6),
-            "week_impressions": w_imp,
-            "week_clicks": w_clk,
-            "week_applicable_revenue": round(w_app, 6),
-            "week_not_applicable_revenue": round(w_na, 6),
-            "today_applicable_revenue": round(t_app, 6),
-            "today_not_applicable_revenue": round(t_na, 6),
-            "today_ios_share_pct": round((t_ios / t_imp_os) * 100, 2) if t_imp_os else 0,
-            "week_ios_share_pct": round((w_ios / w_imp_os) * 100, 2) if w_imp_os else 0,
-            "first_data_date": first_date,
-            "last_synced_at": now_iso,
-            "updated_at": now_iso,
-        }
-        supabase.table("network_code_performance").upsert(perf_row, on_conflict="network_code").execute()
-        add_to_bq_batch("network_code_performance", [perf_row])
-        log.info("bigquery: queued 1 network_code_performance row for %s", network_code)
-    except Exception as e:
-        log.warning("Performance summary failed for %s: %s", network_code, str(e)[:200])
+def clear_sync_error_cache(network_code: str) -> None:
+    """Forget the last recorded error for a code after a successful sync, so a
+    later re-occurrence is mirrored to BigQuery again."""
+    with _sync_error_lock:
+        _sync_error_cache.pop(network_code, None)
 
 
 def submit_all_report_jobs(codes: list[tuple[str, str]], end_date: str, supabase: SupabaseClient, token: str) -> list[dict]:
@@ -1451,24 +1197,15 @@ def poll_all_report_jobs(jobs: list[dict], supabase: SupabaseClient, token: str)
     return completed
 
 
-def upsert_daily_rows(supabase: SupabaseClient, network_code: str, rows: list[dict], now_iso: str) -> int:
-    """Upsert fetched report rows into adx_daily_stats (batched, 500/call).
+def upsert_daily_rows(network_code: str, rows: list[dict], now_iso: str) -> int:
+    """Collapse fetched report rows and queue them for the BigQuery mirror.
     Report rows are per (date, app, OS); they're collapsed back to per (date, app)
-    for adx_daily_stats, and the per-OS impression split is stored in adx_os_stats
-    (used for the dashboard's iOS % column)."""
+    for adx_daily_stats, and the per-OS impression split goes to adx_os_stats
+    (used for the dashboard's iOS % column).
+
+    Supabase is not written here — report tables live in BigQuery only."""
     if not rows:
         return 0
-
-    # Replace, don't accumulate: every cycle re-fetches [effective_start, today],
-    # so first delete this code's rows already stored in the fetched date range.
-    # Prevents duplicate/leftover rows from piling up and flipping daily totals.
-    _dates = sorted({r["date"] for r in rows})
-    if _dates:
-        _min, _max = _dates[0], _dates[-1]
-        try:
-            supabase.table("adx_daily_stats").delete().eq("network_code", network_code).gte("date", _min).lte("date", _max).execute()
-        except Exception as e:
-            log.warning("pre-delete adx_daily_stats failed for %s: %s", network_code, str(e)[:200])
 
     to_upsert = [
         {
@@ -1484,11 +1221,6 @@ def upsert_daily_rows(supabase: SupabaseClient, network_code: str, rows: list[di
         }
         for r in aggregate_daily_rows(rows)
     ]
-    total = 0
-    for i in range(0, len(to_upsert), 500):
-        batch = to_upsert[i:i + 500]
-        resp = supabase.table("adx_daily_stats").upsert(batch, on_conflict="network_code,date,platform").execute()
-        total += len(resp.data) if resp.data else 0
 
     os_upsert = [
         {
@@ -1500,17 +1232,6 @@ def upsert_daily_rows(supabase: SupabaseClient, network_code: str, rows: list[di
         }
         for r in aggregate_os_rows(rows)
     ]
-    if _dates:
-        try:
-            supabase.table("adx_os_stats").delete().eq("network_code", network_code).gte("date", _min).lte("date", _max).execute()
-        except Exception as e:
-            log.warning("pre-delete adx_os_stats failed for %s: %s", network_code, str(e)[:200])
-    for i in range(0, len(os_upsert), 500):
-        batch = os_upsert[i:i + 500]
-        try:
-            supabase.table("adx_os_stats").upsert(batch, on_conflict="network_code,date,os").execute()
-        except Exception as e:
-            log.warning("adx_os_stats upsert failed for %s: %s", network_code, str(e)[:200])
 
     if to_upsert:
         add_to_bq_batch("adx_daily_stats", to_upsert)
@@ -1518,115 +1239,13 @@ def upsert_daily_rows(supabase: SupabaseClient, network_code: str, rows: list[di
     if os_upsert:
         add_to_bq_batch("adx_os_stats", os_upsert)
         log.info("bigquery: queued %d adx_os_stats row(s) for %s", len(os_upsert), network_code)
-    return total
-
-
-def refresh_performance_bulk(supabase: SupabaseClient, downloaded: list[dict], now_iso: str) -> None:
-    """Compute today / last-7-days summaries from the just-fetched rows and
-    batch-upsert network_code_performance.
-
-    Every cycle re-fetches the FULL [effective_start, today] window, which always
-    covers [week_start, today]. Those rows are exactly what the SELECT-based
-    per-code refresh reads, so computing from memory is 100% equivalent — but with
-    ~2 bulk DB calls instead of 3 per code."""
-    if not downloaded:
-        return
-    today = get_date_days_ago(0)
-    week_start = get_date_days_ago(6)  # last 7 days inclusive (matches dashboard "7 days")
-
-    # Existing first_data_date for every code — one paginated query.
-    existing: dict[str, str] = {}
-    try:
-        offset = 0
-        while True:
-            resp = supabase.table("network_code_performance").select(
-                "network_code, first_data_date"
-            ).range(offset, offset + 999).execute()
-            chunk = resp.data or []
-            for r in chunk:
-                existing[r.get("network_code")] = r.get("first_data_date")
-            if len(chunk) < 1000:
-                break
-            offset += 1000
-    except Exception as e:
-        log.warning("Could not read existing performance rows: %s", str(e)[:200])
-
-    upserts: list[dict] = []
-    for d in downloaded:
-        rows = d["rows"]
-        if not rows:
-            # Empty report: keep the previously stored summary untouched.
-            continue
-        t_rev = t_imp = t_clk = t_app = t_na = 0
-        w_rev = w_imp = w_clk = w_app = w_na = 0
-        t_imp_os = w_imp_os = t_ios = w_ios = 0
-        first = existing.get(d["network_code"])
-        for r in rows:
-            rev = float(r.get("revenue") or 0)
-            imp = int(r.get("impressions") or 0)
-            clk = int(r.get("clicks") or 0)
-            dt = r.get("date") or ""
-            if not first or dt < first:
-                first = dt
-            is_na = (r.get("platform") or "").strip() == "(Not applicable)"
-            is_ios = is_ios_os(r.get("os") or "")
-            in_week = dt >= week_start
-            if in_week:
-                w_imp_os += imp
-                if is_ios:
-                    w_ios += imp
-            if dt == today:
-                t_rev += rev
-                t_imp += imp
-                t_clk += clk
-                t_imp_os += imp
-                if is_ios:
-                    t_ios += imp
-                if is_na:
-                    t_na += rev
-                else:
-                    t_app += rev
-            if in_week:
-                w_rev += rev
-                w_imp += imp
-                w_clk += clk
-                if is_na:
-                    w_na += rev
-                else:
-                    w_app += rev
-        upserts.append({
-            "network_code": d["network_code"],
-            "today_revenue": round(t_rev, 6),
-            "today_impressions": t_imp,
-            "today_clicks": t_clk,
-            "week_revenue": round(w_rev, 6),
-            "week_impressions": w_imp,
-            "week_clicks": w_clk,
-            "week_applicable_revenue": round(w_app, 6),
-            "week_not_applicable_revenue": round(w_na, 6),
-            "today_applicable_revenue": round(t_app, 6),
-            "today_not_applicable_revenue": round(t_na, 6),
-            "today_ios_share_pct": round((t_ios / t_imp_os) * 100, 2) if t_imp_os else 0,
-            "week_ios_share_pct": round((w_ios / w_imp_os) * 100, 2) if w_imp_os else 0,
-            "first_data_date": first,
-            "last_synced_at": now_iso,
-            "updated_at": now_iso,
-        })
-
-    for i in range(0, len(upserts), 500):
-        supabase.table("network_code_performance").upsert(
-            upserts[i:i + 500], on_conflict="network_code"
-        ).execute()
-
-    if upserts:
-        add_to_bq_batch("network_code_performance", upserts)
-        log.info("bigquery: queued %d network_code_performance row(s) for batch load", len(upserts))
+    return len(to_upsert)
 
 
 def process_completed_jobs(completed_jobs: list[dict], supabase: SupabaseClient, token: str) -> tuple[int, int]:
-    """Phase C — download all CSVs concurrently, upsert all rows, then batch
-    refresh pre-computed summaries (no per-code DB round-trips).
-    Returns (total_rows_upserted, error_count)."""
+    """Phase C — download all CSVs concurrently, queue rows for the BigQuery
+    mirror, then advance the network_codes watermark.
+    Returns (total_rows_processed, error_count)."""
     now_iso = datetime.now(timezone.utc).isoformat()
 
     # C1: download + parse all reports concurrently (keeps rows in memory)
@@ -1647,69 +1266,50 @@ def process_completed_jobs(completed_jobs: list[dict], supabase: SupabaseClient,
             else:
                 downloaded.append(res)
 
-    # C2: upsert rows into adx_daily_stats concurrently
+    # C2: collapse rows into adx_daily_stats / adx_os_stats for BigQuery
     def up(d: dict) -> tuple[str, bool]:
         try:
-            db = _supabase_client()
-            upsert_daily_rows(db, d["network_code"], d["rows"], now_iso)
+            upsert_daily_rows(d["network_code"], d["rows"], now_iso)
             return (d["network_code"], True)
         except Exception as e:
-            record_sync_failure(_supabase_client(), d["network_code"], e, "phase-c2-upsert")
+            record_sync_failure(_supabase_client(), d["network_code"], e, "phase-c2-queue")
             return ("", False)
 
-    upserted_codes: list[str] = []
+    processed_codes: list[str] = []
     with ThreadPoolExecutor(max_workers=DOWNLOAD_CONCURRENCY) as executor:
         for code, ok in executor.map(up, downloaded):
             if ok:
-                upserted_codes.append(code)
+                processed_codes.append(code)
             else:
                 error_count += 1
 
-    # C3: batch refresh pre-computed summaries. The SQL RPC is the single source
-    # of truth — it recomputes today / last-7 / last-30 day totals server-side
-    # from the frozen raw tables, so the dashboard never drifts between cycles.
-    # The in-memory fallback (refresh_performance_bulk) only runs when the
-    # migration (migration_dashboard_totals.sql) hasn't been applied yet.
-    rpc_ok = False
-    try:
-        supabase.rpc("refresh_dashboard_totals").execute()
-        rpc_ok = True
-    except Exception as e:
-        log.warning("refresh_dashboard_totals skipped (migration not applied?): %s", str(e)[:200])
-    if not rpc_ok:
-        refresh_performance_bulk(supabase, downloaded, now_iso)
-
-    # C4: advance last_synced_at + clear errors for non-empty reports (bulk)
-    if upserted_codes:
-        for i in range(0, len(upserted_codes), 100):
-            chunk = upserted_codes[i:i + 100]
+    # C3: advance last_synced_at for every code whose download succeeded (bulk)
+    if processed_codes:
+        for i in range(0, len(processed_codes), 100):
+            chunk = processed_codes[i:i + 100]
             try:
                 supabase.table("network_codes").update({
                     "last_synced_at": now_iso,
                     "updated_at": now_iso,
                 }).in_("network_code", chunk).execute()
-                supabase.table("adx_sync_errors").delete().in_("network_code", chunk).execute()
                 add_to_bq_batch(
                     "network_codes",
                     [{"network_code": c, "last_synced_at": now_iso, "updated_at": now_iso} for c in chunk],
                 )
                 log.info("bigquery: queued %d network_codes row(s) for batch load", len(chunk))
+                for c in chunk:
+                    clear_sync_error_cache(c)
             except Exception as e:
                 log.warning("Batch last_synced update failed: %s", str(e)[:200])
 
     # Empty (0-row) reports are a success but must NOT advance last_synced_at
-    # (matches legacy per-code path) — only clear any stale error.
-    empty_codes = [d["network_code"] for d in downloaded if not d["rows"]]
-    if empty_codes:
-        for i in range(0, len(empty_codes), 100):
-            chunk = empty_codes[i:i + 100]
-            try:
-                supabase.table("adx_sync_errors").delete().in_("network_code", chunk).execute()
-            except Exception as e:
-                log.warning("Batch error clear failed: %s", str(e)[:200])
+    # (matches legacy per-code path) — just forget any cached error for the code.
+    for d in downloaded:
+        if not d["rows"]:
+            clear_sync_error_cache(d["network_code"])
 
     total_rows = sum(len(d["rows"]) for d in downloaded)
-    log.info("Processed %d codes (%d rows)", len(upserted_codes), total_rows)
+    log.info("Processed %d codes (%d rows)", len(processed_codes), total_rows)
     return total_rows, error_count
 
 
@@ -1765,14 +1365,10 @@ def run_sync_cycle() -> dict:
             "Skipping %d non-ACTIVE code(s) (only tracked in DB): %s",
             len(skipped_list), skipped_list,
         )
-        # Non-ACTIVE codes are never re-synced, so clear any stale sync errors
-        # for them — otherwise old transient/"deleted" errors would linger forever.
-        for i in range(0, len(skipped_list), 100):
-            chunk = skipped_list[i:i + 100]
-            try:
-                supabase.table("adx_sync_errors").delete().in_("network_code", chunk).execute()
-            except Exception as e:
-                log.warning("Stale error clear for non-ACTIVE codes failed: %s", str(e)[:200])
+        # Non-ACTIVE codes are never re-synced, so forget their cached errors
+        # (nothing is deleted from Supabase or BigQuery).
+        for code in skipped_list:
+            clear_sync_error_cache(code)
 
     if not active_list:
         log.info("No ACTIVE network codes found — nothing to sync")
@@ -1827,17 +1423,6 @@ def run_sync_cycle() -> dict:
     completed_jobs = poll_all_report_jobs(submitted_jobs, supabase, token)
     total_rows, error_count = process_completed_jobs(completed_jobs, supabase, token)
 
-    deleted = 0
-    stale_errors_deleted = 0
-    if RETENTION_CLEANUP_ENABLED:
-        cutoff = get_date_days_ago(RETENTION_DAYS)
-        deleted = cleanup_old_data(supabase, cutoff)
-    else:
-        log.info("Retention cleanup disabled (RETENTION_CLEANUP_ENABLED=false)")
-
-    error_cutoff_iso = (datetime.now(timezone.utc) - timedelta(hours=ERROR_RETENTION_HOURS)).isoformat()
-    stale_errors_deleted = cleanup_old_sync_errors(supabase, error_cutoff_iso)
-
     elapsed = round(time.time() - start_time, 1)
     stats = {
         "status": "completed",
@@ -1848,10 +1433,6 @@ def run_sync_cycle() -> dict:
         "codes_skipped_non_active": len(skipped_list),
         "codes_errored": error_count,
         "total_rows_upserted": total_rows,
-        "rows_deleted": deleted,
-        "sync_errors_deleted": stale_errors_deleted,
-        "retention_days": RETENTION_DAYS,
-        "error_retention_hours": ERROR_RETENTION_HOURS,
         "elapsed_seconds": elapsed,
     }
     try:
@@ -1877,20 +1458,9 @@ def main():
 
     log.info("=" * 60)
     log.info("GAM AdX Sync Bot starting")
-    log.info("Interval: %d min | Submit/Download: %d/%d | Retention: %d days", SYNC_INTERVAL, SUBMIT_CONCURRENCY, DOWNLOAD_CONCURRENCY, RETENTION_DAYS)
-    log.info("Supabase: %s", SUPABASE_URL)
+    log.info("Interval: %d min | Submit/Download: %d/%d", SYNC_INTERVAL, SUBMIT_CONCURRENCY, DOWNLOAD_CONCURRENCY)
+    log.info("Supabase: %s (network_codes only)", SUPABASE_URL)
     log.info("=" * 60)
-
-    # One-time cleanup: remove any adx_daily_stats rows older than a child's join date.
-    # Idempotent — after the first run there is nothing left to remove.
-    if PREJOIN_CLEANUP_ENABLED:
-        try:
-            startup_supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
-            cleanup_prejoin_data(startup_supabase)
-        except Exception as e:
-            log.warning("Pre-join cleanup skipped: %s", str(e)[:200])
-    else:
-        log.info("Pre-join cleanup disabled (PREJOIN_CLEANUP_ENABLED=false)")
 
     cycle = 0
     while not shutdown_flag.is_set():
